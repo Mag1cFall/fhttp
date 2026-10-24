@@ -29,10 +29,10 @@ import (
 
 	tls "github.com/bogdanfinn/utls"
 
-	http "github.com/bogdanfinn/fhttp"
-	"github.com/bogdanfinn/fhttp/httptrace"
+	http "github.com/Mag1cFall/fhttp"
+	"github.com/Mag1cFall/fhttp/httptrace"
 
-	"github.com/bogdanfinn/fhttp/http2/hpack"
+	"github.com/Mag1cFall/fhttp/http2/hpack"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/idna"
 )
@@ -108,6 +108,11 @@ type Transport struct {
 
 	Priorities        []Priority
 	PseudoHeaderOrder []string
+
+	// StreamWindowUpdate 非零时是每个请求流在 HEADERS 帧之后立即发送的 WINDOW_UPDATE 增量，Firefox 以此把流接收窗口从 128 KiB 开到 12 MiB
+	StreamWindowUpdate uint32
+	// WindowUpdateThreshold 非零时是连接与每个流累计到多少未确认字节才以 WINDOW_UPDATE 一次归还，Firefox 为 4 MiB
+	WindowUpdateThreshold uint32
 
 	// PushHandler is called upon receiving PUSH_PROMISEs from the server.
 	// If nil, server push is disabled.
@@ -1244,7 +1249,13 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 
 	cc.wmu.Lock()
 	endStream := !hasBody && !hasTrailers
-	werr := cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+	cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+	if cc.t.StreamWindowUpdate != 0 {
+		cc.fr.WriteWindowUpdate(cs.ID, cc.t.StreamWindowUpdate)
+		cs.inflow.add(int32(cc.t.StreamWindowUpdate))
+	}
+	cc.bw.Flush()
+	werr := cc.werr
 	cc.wmu.Unlock()
 	traceWroteHeaders(cs.trace)
 	cc.mu.Unlock()
@@ -1446,11 +1457,6 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 			cc.fr.WriteContinuation(streamID, endHeaders, chunk)
 		}
 	}
-	// TODO(bradfitz): this Flush could potentially block (as
-	// could the WriteHeaders call(s) above), which means they
-	// wouldn't respond to Request.Cancel being readable. That's
-	// rare, but this should probably be in a goroutine.
-	cc.bw.Flush()
 
 	return cc.werr
 }
@@ -2443,42 +2449,55 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 
 	var connAdd, streamAdd int32
 
-	// Check the conn-level first, before the stream-level.
-	// Use dynamic connFlow logic
-	if v := cc.inflow.available(); v < int32(cc.connFlow/2) {
-		connAdd = int32(cc.connFlow) - v
-		cc.inflow.add(connAdd)
-	}
-
-	if err == nil {
-		// Consider any buffered body data (read from the conn but not
-		// consumed by the client) when computing flow control for this
-		// stream.
-
-		// Use dynamic streamFlow logic
-		unsent := int(cc.streamFlow) - int(cs.inflow.available()) + cs.bufPipe.Len()
-
-		// ------------------------------------------------------------------
-		// FIX: Adaptive Logic
-		// ------------------------------------------------------------------
-		const aggressiveThreshold = 16384 // 16KB
-
-		// Check if the configured initial window is small (e.g. Firefox's 128KB or 65KB).
-		// If so, we need to be aggressive with updates.
-		isSmallWindow := cc.initialWindowSize < 1048576 // < 1MB
-
-		if isSmallWindow {
-			if unsent > aggressiveThreshold {
-				streamAdd = int32(unsent)
+	if threshold := int32(cc.t.WindowUpdateThreshold); threshold != 0 {
+		if unacked := int32(cc.connFlow) + initialWindowSize - cc.inflow.available(); unacked >= threshold {
+			connAdd = unacked
+			cc.inflow.add(connAdd)
+		}
+		if err == nil {
+			if unacked := int32(cc.streamFlow+cc.t.StreamWindowUpdate) - cs.inflow.n - int32(cs.bufPipe.Len()); unacked >= threshold {
+				streamAdd = unacked
 				cs.inflow.add(streamAdd)
 			}
-		} else {
-			// Fallback to standard behavior for large windows (Chrome/Default).
-			// FIX: Replaced transportDefaultStreamFlow constant with cc.streamFlow.
-			// This ensures correct behavior if a user sets a custom Large window (e.g. 6MB).
-			if unsent > transportDefaultStreamMinRefresh && unsent > int(cc.streamFlow)/2 {
-				streamAdd = int32(unsent)
-				cs.inflow.add(streamAdd)
+		}
+	} else {
+		// Check the conn-level first, before the stream-level.
+		// Use dynamic connFlow logic
+		if v := cc.inflow.available(); v < int32(cc.connFlow/2) {
+			connAdd = int32(cc.connFlow) - v
+			cc.inflow.add(connAdd)
+		}
+
+		if err == nil {
+			// Consider any buffered body data (read from the conn but not
+			// consumed by the client) when computing flow control for this
+			// stream.
+
+			// Use dynamic streamFlow logic
+			unsent := int(cc.streamFlow) - int(cs.inflow.available()) + cs.bufPipe.Len()
+
+			// ------------------------------------------------------------------
+			// FIX: Adaptive Logic
+			// ------------------------------------------------------------------
+			const aggressiveThreshold = 16384 // 16KB
+
+			// Check if the configured initial window is small (e.g. Firefox's 128KB or 65KB).
+			// If so, we need to be aggressive with updates.
+			isSmallWindow := cc.initialWindowSize < 1048576 // < 1MB
+
+			if isSmallWindow {
+				if unsent > aggressiveThreshold {
+					streamAdd = int32(unsent)
+					cs.inflow.add(streamAdd)
+				}
+			} else {
+				// Fallback to standard behavior for large windows (Chrome/Default).
+				// FIX: Replaced transportDefaultStreamFlow constant with cc.streamFlow.
+				// This ensures correct behavior if a user sets a custom Large window (e.g. 6MB).
+				if unsent > transportDefaultStreamMinRefresh && unsent > int(cc.streamFlow)/2 {
+					streamAdd = int32(unsent)
+					cs.inflow.add(streamAdd)
+				}
 			}
 		}
 	}

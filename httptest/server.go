@@ -19,8 +19,8 @@ import (
 
 	tls "github.com/bogdanfinn/utls"
 
-	http "github.com/bogdanfinn/fhttp"
-	"github.com/bogdanfinn/fhttp/internal"
+	http "github.com/Mag1cFall/fhttp"
+	"github.com/Mag1cFall/fhttp/internal"
 )
 
 // A Server is an HTTP server listening on a system-chosen port on the

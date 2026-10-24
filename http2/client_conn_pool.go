@@ -11,7 +11,7 @@ import (
 
 	tls "github.com/bogdanfinn/utls"
 
-	http "github.com/bogdanfinn/fhttp"
+	http "github.com/Mag1cFall/fhttp"
 )
 
 // ClientConnPool manages a pool of HTTP/2 client connections.
