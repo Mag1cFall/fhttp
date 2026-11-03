@@ -1249,7 +1249,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 
 	cc.wmu.Lock()
 	endStream := !hasBody && !hasTrailers
-	cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
+	cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs, cc.headerPriority(req))
 	if cc.t.StreamWindowUpdate != 0 {
 		cc.fr.WriteWindowUpdate(cs.ID, cc.t.StreamWindowUpdate)
 		cs.inflow.add(int32(cc.t.StreamWindowUpdate))
@@ -1424,8 +1424,27 @@ func (cc *ClientConn) awaitOpenSlotForRequest(req *http.Request) error {
 	}
 }
 
+// headerPriorityKey 是请求上下文中该请求 HEADERS 帧优先级的键
+type headerPriorityKey struct{}
+
+// WithHeaderPriority 返回带 HEADERS 帧优先级的 ctx，以它发出的请求用 priority 代替 Transport.HeaderPriority
+func WithHeaderPriority(ctx context.Context, priority PriorityParam) context.Context {
+	return context.WithValue(ctx, headerPriorityKey{}, priority)
+}
+
+// headerPriority 返回 req 的 HEADERS 帧优先级：请求上下文中的优先级，其次 Transport.HeaderPriority，都没有时为独占、权重 255
+func (cc *ClientConn) headerPriority(req *http.Request) PriorityParam {
+	if priority, ok := req.Context().Value(headerPriorityKey{}).(PriorityParam); ok {
+		return priority
+	}
+	if cc.t.HeaderPriority != nil {
+		return *cc.t.HeaderPriority
+	}
+	return PriorityParam{Exclusive: true, Weight: 255}
+}
+
 // requires cc.wmu be held
-func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte) error {
+func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize int, hdrs []byte, priority PriorityParam) error {
 	first := true // first frame written (HEADERS is first, then CONTINUATION)
 	for len(hdrs) > 0 && cc.werr == nil {
 		chunk := hdrs
@@ -1435,22 +1454,12 @@ func (cc *ClientConn) writeHeaders(streamID uint32, endStream bool, maxFrameSize
 		hdrs = hdrs[len(chunk):]
 		endHeaders := len(hdrs) == 0
 		if first {
-			defaultHeaderPriorityParam := PriorityParam{
-				Exclusive: true,
-				Weight:    255,
-				StreamDep: 0,
-			}
-
-			if cc.t.HeaderPriority != nil {
-				defaultHeaderPriorityParam = *cc.t.HeaderPriority
-			}
-
 			cc.fr.WriteHeaders(HeadersFrameParam{
 				StreamID:      streamID,
 				BlockFragment: chunk,
 				EndStream:     endStream,
 				EndHeaders:    endHeaders,
-				Priority:      defaultHeaderPriorityParam,
+				Priority:      priority,
 			})
 			first = false
 		} else {
@@ -1651,7 +1660,7 @@ func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (
 	// Two ways to send END_STREAM: either with trailers, or
 	// with an empty DATA frame.
 	if len(trls) > 0 {
-		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls)
+		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls, cc.headerPriority(cs.req))
 	} else {
 		err = cc.fr.WriteData(cs.ID, true, nil)
 	}
