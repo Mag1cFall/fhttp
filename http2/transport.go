@@ -327,6 +327,7 @@ type ClientConn struct {
 
 	hbuf             bytes.Buffer // HPACK encoder writes into this
 	henc             *hpack.Encoder
+	hencMaxTableSize uint32 // effective max dynamic table size currently applied to henc (guarded by mu, like henc)
 	highestPromiseID uint32 // highest promise id so far received from server
 
 	idleTimeout time.Duration // or 0 for never
@@ -780,8 +781,13 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 	// FIX: Initialize dynamic flow control variables correctly
 	// ------------------------------------------------------------------
 
-	// 1. Determine Stream Flow (default to 4MB if not set in profile)
-	cc.streamFlow = transportDefaultStreamFlow
+	// 1. Determine Stream Flow. This has to match the window the peer will
+	// actually use: we only ever tell it about our window via
+	// SETTINGS_INITIAL_WINDOW_SIZE, so when the profile does not set that
+	// setting the peer stays on the RFC 7540 default and we must too.
+	// Claiming a larger window than we advertised makes the refresh
+	// threshold below unreachable and stalls the stream forever.
+	cc.streamFlow = initialWindowSize
 	if v, ok := t.Settings[SettingInitialWindowSize]; ok && v != 0 {
 		cc.streamFlow = v
 	}
@@ -830,9 +836,14 @@ func (t *Transport) newClientConn(c net.Conn, addr string, singleUse bool) (*Cli
 
 	cc.fr.MaxHeaderListSize = t.maxHeaderListSize()
 
-	// TODO: SetMaxDynamicTableSize, SetMaxDynamicTableSizeLimit on
-	// henc in response to SETTINGS frames?
 	cc.henc = hpack.NewEncoder(&cc.hbuf)
+	// The encoder starts at the HPACK protocol-default dynamic table size
+	// (4096). We only ever shrink it in response to a peer SETTINGS frame
+	// advertising a smaller SETTINGS_HEADER_TABLE_SIZE (see processSettings);
+	// we never grow above 4096, matching browser encoders. Tracking the
+	// currently-applied size lets us avoid emitting a spurious Dynamic Table
+	// Size Update when the peer allows >= 4096 (the common case).
+	cc.hencMaxTableSize = initialHeaderTableSize
 
 	if t.AllowHTTP {
 		cc.nextStreamID = 3
@@ -1770,7 +1781,7 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 
 		if !ok {
 			pHeaderOrder = cc.t.PseudoHeaderOrder
-			ok = true
+			ok = len(pHeaderOrder) > 0
 		}
 
 		m := req.Method
@@ -1784,7 +1795,7 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 				case ":authority":
 					f(":authority", host)
 				case ":method":
-					f(":method", req.Method)
+					f(":method", m)
 				case ":path":
 					if req.Method != "CONNECT" {
 						f(":path", path)
@@ -1815,6 +1826,9 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 		// Should clone, because this function is called twice; to read and to write.
 		// If headers are added to the req, then headers would be added twice.
 		hdrs := req.Header.Clone()
+		if hdrs == nil {
+			hdrs = make(http.Header)
+		}
 		if _, ok := req.Header["content-length"]; !ok && shouldSendReqContentLength(req.Method, contentLength) {
 			hdrs["content-length"] = []string{strconv.FormatInt(contentLength, 10)}
 		}
@@ -1890,7 +1904,7 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 					kv.Values = kv.Values[:1]
 				}
 
-				if kv.Values[0] == "" {
+				if len(kv.Values) == 0 || kv.Values[0] == "" {
 					continue
 				}
 			}
@@ -2483,7 +2497,7 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 			// stream.
 
 			// Use dynamic streamFlow logic
-			unsent := int(cc.streamFlow) - int(cs.inflow.available()) + cs.bufPipe.Len()
+			unsent := int(cc.streamFlow) - int(cs.inflow.available()) - cs.bufPipe.Len()
 
 			// ------------------------------------------------------------------
 			// FIX: Adaptive Logic
@@ -2752,12 +2766,35 @@ func (rl *clientConnReadLoop) processSettings(f *SettingsFrame) error {
 			cc.cond.Broadcast()
 
 			cc.initialWindowSize = s.Val
+		case SettingHeaderTableSize:
+			// Honor the peer's advertised maximum HPACK dynamic table size
+			// for our request-header encoder (RFC 7541 §4.2 / §6.3). henc is
+			// guarded by cc.mu, which is held here.
+			//
+			// We cap the effective size at the protocol default (4096) — real
+			// browser encoders do not use larger dynamic tables — and only
+			// touch the encoder when the effective size actually changes.
+			// Consequently the common case, where the peer allows >= 4096, is
+			// a no-op and emits NO Dynamic Table Size Update, keeping our HPACK
+			// byte stream identical to a browser that stays at the default.
+			// The change bites only when a peer advertises a table size < 4096
+			// (e.g. 0): previously the encoder kept indexing up to 4096 in
+			// violation of the peer's limit; now it correctly shrinks and
+			// signals the update.
+			effectiveTableSize := s.Val
+			if effectiveTableSize > initialHeaderTableSize {
+				effectiveTableSize = initialHeaderTableSize
+			}
+			if effectiveTableSize != cc.hencMaxTableSize {
+				cc.henc.SetMaxDynamicTableSize(effectiveTableSize)
+				cc.hencMaxTableSize = effectiveTableSize
+			}
 		case SettingEnableConnectProtocol:
 			if err := s.Valid(); err != nil {
 				return err
 			}
 		default:
-			// TODO(bradfitz): handle more settings? SETTINGS_HEADER_TABLE_SIZE probably.
+			// TODO(bradfitz): handle more settings?
 			cc.vlogf("Unhandled Setting: %v", s)
 		}
 

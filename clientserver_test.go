@@ -430,8 +430,8 @@ func TestH12_HandlerWritesTooMuch(t *testing.T) {
 func TestH12_AutoGzip(t *testing.T) {
 	h12Compare{
 		Handler: func(w ResponseWriter, r *Request) {
-			if ae := r.Header.Get("Accept-Encoding"); ae != "gzip" {
-				t.Errorf("%s Accept-Encoding = %q; want gzip", r.Proto, ae)
+			if ae := r.Header.Get("Accept-Encoding"); ae != transportAcceptEncoding {
+				t.Errorf("%s Accept-Encoding = %q; want %q", r.Proto, ae, transportAcceptEncoding)
 			}
 			w.Header().Set("Content-Encoding", "gzip")
 			gz := gzip.NewWriter(w)
@@ -1162,8 +1162,20 @@ func testTransportRejectsInvalidHeaders(t *testing.T, h2 bool) {
 
 func TestInterruptWithPanic_h1(t *testing.T)     { testInterruptWithPanic(t, h1Mode, "boom") }
 func TestInterruptWithPanic_h2(t *testing.T)     { testInterruptWithPanic(t, h2Mode, "boom") }
-func TestInterruptWithPanic_nil_h1(t *testing.T) { testInterruptWithPanic(t, h1Mode, nil) }
-func TestInterruptWithPanic_nil_h2(t *testing.T) { testInterruptWithPanic(t, h2Mode, nil) }
+func TestInterruptWithPanic_nil_h1(t *testing.T) { testInterruptWithPanicNil(t, h1Mode) }
+func TestInterruptWithPanic_nil_h2(t *testing.T) { testInterruptWithPanicNil(t, h2Mode) }
+
+// Since Go 1.21 panic(nil) reports a *runtime.PanicNilError, which the server
+// logs; GODEBUG=panicnil=1 restores the old behaviour this test asserts.
+// t.Setenv cannot be combined with t.Parallel, and setParallel inside
+// testInterruptWithPanic calls t.Parallel in short mode, so skip there.
+func testInterruptWithPanicNil(t *testing.T, h2 bool) {
+	if testing.Short() {
+		t.Skip("skipping in short mode: needs GODEBUG=panicnil=1, which cannot be combined with t.Parallel")
+	}
+	t.Setenv("GODEBUG", "panicnil=1")
+	testInterruptWithPanic(t, h2, nil)
+}
 func TestInterruptWithPanic_ErrAbortHandler_h1(t *testing.T) {
 	testInterruptWithPanic(t, h1Mode, ErrAbortHandler)
 }
@@ -1490,9 +1502,9 @@ func testWriteHeaderAfterWrite(t *testing.T, h2, hijack bool) {
 		return
 	}
 	gotLog := strings.TrimSpace(errorLog.String())
-	wantLog := "http: superfluous response.WriteHeader call from net/http_test.testWriteHeaderAfterWrite.func1 (clientserver_test.go:"
+	wantLog := "http: superfluous response.WriteHeader call from github.com/Mag1cFall/fhttp_test.testWriteHeaderAfterWrite.func1 (clientserver_test.go:"
 	if hijack {
-		wantLog = "http: response.WriteHeader on hijacked connection from net/http_test.testWriteHeaderAfterWrite.func1 (clientserver_test.go:"
+		wantLog = "http: response.WriteHeader on hijacked connection from github.com/Mag1cFall/fhttp_test.testWriteHeaderAfterWrite.func1 (clientserver_test.go:"
 	}
 	if !strings.HasPrefix(gotLog, wantLog) {
 		t.Errorf("stderr output = %q; want %q", gotLog, wantLog)
