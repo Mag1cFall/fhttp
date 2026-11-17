@@ -109,6 +109,9 @@ type Transport struct {
 	Priorities        []Priority
 	PseudoHeaderOrder []string
 
+	// PriorityDependencies 为真时每个请求的 HEADERS 帧按 Chrome 网络栈的 HTTP/2 优先级依赖，独占依赖于连接上仍打开、权重不低于它的流中权重最低且最晚创建的一条，没有这样的流时依赖 0
+	PriorityDependencies bool
+
 	// StreamWindowUpdate 非零时是每个请求流在 HEADERS 帧之后立即发送的 WINDOW_UPDATE 增量，Firefox 以此把流接收窗口从 128 KiB 开到 12 MiB
 	StreamWindowUpdate uint32
 	// WindowUpdateThreshold 非零时是连接与每个流累计到多少未确认字节才以 WINDOW_UPDATE 一次归还，Firefox 为 4 MiB
@@ -392,6 +395,7 @@ type clientStream struct {
 	pastTrailers bool // got optional second MetaHeadersFrame (trailers)
 
 	peerReset     chan struct{} // closed on peer reset
+	priority      PriorityParam // HEADERS 帧写入的优先级，创建流时确定
 	readErr       error         // sticky read error; owned by transportResponseBody.Read
 	req           *http.Request
 	requestedGzip bool
@@ -1242,7 +1246,12 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 		return nil, false, err
 	}
 
+	priority := cc.headerPriority(req)
+	if cc.t.PriorityDependencies {
+		priority.StreamDep = cc.priorityParent(priority.Weight)
+	}
 	cs := cc.newStream()
+	cs.priority = priority
 	cs.req = req
 	cs.trace = httptrace.ContextClientTrace(req.Context())
 	cs.requestedGzip = requestedGzip
@@ -1260,7 +1269,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 
 	cc.wmu.Lock()
 	endStream := !hasBody && !hasTrailers
-	cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs, cc.headerPriority(req))
+	cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs, cs.priority)
 	if cc.t.StreamWindowUpdate != 0 {
 		cc.fr.WriteWindowUpdate(cs.ID, cc.t.StreamWindowUpdate)
 		cs.inflow.add(int32(cc.t.StreamWindowUpdate))
@@ -1671,7 +1680,7 @@ func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (
 	// Two ways to send END_STREAM: either with trailers, or
 	// with an empty DATA frame.
 	if len(trls) > 0 {
-		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls, cc.headerPriority(cs.req))
+		err = cc.writeHeaders(cs.ID, true, maxFrameSize, trls, cs.priority)
 	} else {
 		err = cc.fr.WriteData(cs.ID, true, nil)
 	}
@@ -2013,6 +2022,20 @@ type resAndError struct {
 	_   incomparable
 	err error
 	res *http.Response
+}
+
+// priorityParent 返回 Chrome 网络栈为权重 weight 的新流选择的依赖：连接上仍打开、权重不低于 weight 的流中权重最低且最晚创建的一条，没有时为 0；调用方持有 cc.mu
+func (cc *ClientConn) priorityParent(weight uint8) uint32 {
+	var parent *clientStream
+	for _, cs := range cc.streams {
+		if cs.priority.Weight >= weight && (parent == nil || cs.priority.Weight < parent.priority.Weight || cs.priority.Weight == parent.priority.Weight && cs.ID > parent.ID) {
+			parent = cs
+		}
+	}
+	if parent == nil {
+		return 0
+	}
+	return parent.ID
 }
 
 // requires cc.mu be held.
